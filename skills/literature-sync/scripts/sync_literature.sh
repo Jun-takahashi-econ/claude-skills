@@ -36,15 +36,29 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# ---- Locate the gemini-pdf skill (plugin install or manual copy) ------------
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/gemini-pdf" ]; then
+# ---- Locate the gemini-pdf skill --------------------------------------------
+# Search order:
+#   1. GEMINI_PDF_SKILL_DIR  (explicit env override)
+#   2. $CLAUDE_PLUGIN_ROOT/skills/gemini-pdf  (same-plugin layout)
+#   3. ~/.claude/skills/gemini-pdf            (manual copy)
+#   4. ~/.claude/plugins/** (plugin-install cache: find pdf_to_markdown.sh)
+GEMINI_PDF=""
+if [ -n "${GEMINI_PDF_SKILL_DIR:-}" ] && [ -d "$GEMINI_PDF_SKILL_DIR" ]; then
+  GEMINI_PDF="$GEMINI_PDF_SKILL_DIR"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/gemini-pdf" ]; then
   GEMINI_PDF="$CLAUDE_PLUGIN_ROOT/skills/gemini-pdf"
 elif [ -d "$HOME/.claude/skills/gemini-pdf" ]; then
   GEMINI_PDF="$HOME/.claude/skills/gemini-pdf"
 else
+  hit="$(find "$HOME/.claude/plugins" -type f -name pdf_to_markdown.sh -path '*gemini-pdf*' 2>/dev/null | head -1 || true)"
+  if [ -n "$hit" ]; then
+    GEMINI_PDF="$(cd "$(dirname "$hit")/.." && pwd)"
+  fi
+fi
+if [ -z "$GEMINI_PDF" ]; then
   echo "ERROR: gemini-pdf skill not found." >&2
-  echo "       Install it first from Kasahara's claude-code-skills," >&2
-  echo "       then sign in to Antigravity CLI (agy)." >&2
+  echo "       Install it (plugin: gemini-pdf@kasahara-skills, or copy to ~/.claude/skills/)," >&2
+  echo "       or point GEMINI_PDF_SKILL_DIR at its folder. Then sign in to agy." >&2
   exit 1
 fi
 CONVERT="$GEMINI_PDF/scripts/pdf_to_markdown.sh"
