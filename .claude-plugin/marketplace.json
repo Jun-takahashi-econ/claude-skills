@@ -13,7 +13,7 @@
       "source": "./",
       "strict": false,
       "description": "Convert new paper PDFs in a literature folder to Markdown (via the gemini-pdf skill / Antigravity CLI). Idempotent reconcile: PDFs without a matching .md are converted; existing .md files are skipped; raw PDFs are never modified.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "license": "MIT",
       "homepage": "https://github.com/Jun-takahashi-econ/claude-skills",
       "keywords": ["claude-code", "literature", "pdf", "markdown", "gemini-pdf", "reference-library"],

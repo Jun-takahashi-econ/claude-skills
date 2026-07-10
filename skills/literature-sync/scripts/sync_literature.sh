@@ -72,6 +72,30 @@ fi
 mkdir -p "$OUT_DIR" "$LOG_DIR"
 LOG="$LOG_DIR/literature_sync.log"
 
+# ---- Stash converter sidecars out of the md tree ----------------------------
+# gemini-pdf writes <base>.meta.json / <base>.quality.json / <base>.err next to
+# each converted .md. These are conversion diagnostics, not literature: the
+# .md is the only artifact that belongs in literature/md/. Move the sidecars
+# under literature/logs/sidecars/ (logs/ is gitignored, so nothing extra is
+# tracked and only .md stays in the reference tree). Subfolder structure under
+# md/ is mirrored, so identically named papers in different folders never clash.
+_stash_sidecars() {
+  local md="$1" rel reldir base dest f moved=0
+  rel="${md#"$OUT_DIR"/}"
+  reldir="$(dirname "$rel")"
+  base="$(basename "${md%.md}")"
+  dest="$LOG_DIR/sidecars/$reldir"
+  for ext in meta.json quality.json err; do
+    f="${md%.md}.$ext"
+    if [ -f "$f" ]; then
+      mkdir -p "$dest"
+      mv -f "$f" "$dest/$base.$ext"
+      moved=1
+    fi
+  done
+  [ "$moved" -eq 1 ] && echo "[$(date -u +%FT%TZ)] stashed sidecars -> $dest/$base.*" >>"$LOG"
+}
+
 # ---- Find PDFs without a matching .md (mirror subfolder structure) ----------
 PDFS=()
 while IFS= read -r -d '' f; do PDFS+=("$f"); done \
@@ -112,13 +136,13 @@ for item in "${TODO[@]}"; do
   if [ "$BIB_SYNC" -eq 1 ]; then
     key="$(basename "${md%.md}")"
     if bash "$CONVERT" "$pdf" "$md" --bib-key "$key" >>"$LOG" 2>&1; then
-      ok=$((ok+1))
+      ok=$((ok+1)); _stash_sidecars "$md"
     else
       fail=$((fail+1)); echo "  FAILED (see $LOG)"
     fi
   else
     if bash "$CONVERT" "$pdf" "$md" >>"$LOG" 2>&1; then
-      ok=$((ok+1))
+      ok=$((ok+1)); _stash_sidecars "$md"
     else
       fail=$((fail+1)); echo "  FAILED (see $LOG)"
     fi
