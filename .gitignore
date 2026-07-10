@@ -1,0 +1,21 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.uv/
+
+# Never commit research data, converted output, logs, or secrets.
+# (A skills repo should contain code only — no literature PDFs/MD, no keys.)
+literature/
+*.pdf
+*.md.bak
+*.log
+.env
+*.key

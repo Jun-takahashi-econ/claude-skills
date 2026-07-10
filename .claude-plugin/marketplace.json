@@ -1,0 +1,67 @@
+{
+  "name": "takahashi-skills",
+  "owner": {
+    "name": "Jun-takahashi-econ"
+  },
+  "metadata": {
+    "description": "Personal Claude Code skills for empirical economics research (survey/conjoint experiments, literature management).",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "literature-sync",
+      "source": "./",
+      "strict": false,
+      "description": "Convert new paper PDFs in a literature folder to Markdown (via the gemini-pdf skill / Antigravity CLI). Idempotent reconcile: PDFs without a matching .md are converted; existing .md files are skipped; raw PDFs are never modified.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "homepage": "https://github.com/Jun-takahashi-econ/claude-skills",
+      "keywords": ["claude-code", "literature", "pdf", "markdown", "gemini-pdf", "reference-library"],
+      "skills": ["./skills/literature-sync"]
+    },
+    {
+      "name": "citation-check",
+      "source": "./",
+      "strict": false,
+      "description": "Verify every citation and characterization of cited work in a draft against original source text in the reference library, never model memory. Verdicts: SUPPORTED / MISCHARACTERIZED / MISSING SOURCE.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "homepage": "https://github.com/Jun-takahashi-econ/claude-skills",
+      "keywords": ["claude-code", "citations", "hallucination", "verification", "latex"],
+      "skills": ["./skills/citation-check"]
+    },
+    {
+      "name": "conjoint-amce",
+      "source": "./",
+      "strict": false,
+      "description": "Estimate AMCEs and marginal means from long-format conjoint data with respondent-clustered SEs (Hainmueller-Hopkins-Yamamoto 2014; Leeper et al. 2020), tidy tables + forest plot, and reconcile against existing results.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "homepage": "https://github.com/Jun-takahashi-econ/claude-skills",
+      "keywords": ["claude-code", "conjoint", "amce", "survey-experiment", "econometrics"],
+      "skills": ["./skills/conjoint-amce"]
+    },
+    {
+      "name": "conjoint-diagnostics",
+      "source": "./",
+      "strict": false,
+      "description": "Verification gates for conjoint designs before trusting AMCEs: randomization balance, placebo AMCE, profile order, carryover, clustered-vs-robust SE, comprehension robustness. PASS/FLAG report with stop rules.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "homepage": "https://github.com/Jun-takahashi-econ/claude-skills",
+      "keywords": ["claude-code", "conjoint", "diagnostics", "verification", "placebo"],
+      "skills": ["./skills/conjoint-diagnostics"]
+    },
+    {
+      "name": "refine",
+      "source": "./",
+      "strict": false,
+      "description": "Referee-style prioritized revision memo for an empirical economics draft, ALWAYS delegated to an independent ChatGPT agent (codex CLI preferred, OpenAI API fallback) -- never written by Claude itself.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "homepage": "https://github.com/Jun-takahashi-econ/claude-skills",
+      "keywords": ["claude-code", "referee", "review", "codex", "delegation"],
+      "skills": ["./skills/refine"]
+    }
+  ]
+}
