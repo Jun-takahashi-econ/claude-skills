@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Personal Claude Code skills for empirical economics research (survey/conjoint experiments, literature management).",
-    "version": "0.2.1"
+    "version": "0.2.2"
   },
   "plugins": [
     {
@@ -13,7 +13,7 @@
       "source": "./",
       "strict": false,
       "description": "Convert new paper PDFs in a literature folder to Markdown (via the gemini-pdf skill / Antigravity CLI). Idempotent reconcile: PDFs without a matching .md are converted; existing .md files are skipped; raw PDFs are never modified.",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "license": "MIT",
       "homepage": "https://github.com/Jun-takahashi-econ/claude-skills",
       "keywords": ["claude-code", "literature", "pdf", "markdown", "gemini-pdf", "reference-library"],
