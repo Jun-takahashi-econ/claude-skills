@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # literature-sync: convert every PDF in the source dir that lacks a matching
-# Markdown file, delegating conversion to the gemini-pdf skill (agy / Antigravity).
+# Markdown file, delegating conversion to the gemini-pdf skill (agy / Antigravity),
+# then enrich the result's front matter from Crossref and write a local .bib.
 #
 # Idempotent: existing .md files are skipped. Raw PDFs are never modified or deleted.
 # Sequential by design (agy hangs in parallel). Prints a count-only summary.
@@ -9,19 +10,38 @@ set -euo pipefail
 # ---- Config (override via env or flags) -------------------------------------
 SRC_DIR="${LIT_SRC_DIR:-literature/pdf}"   # where PDFs are dropped
 OUT_DIR="${LIT_OUT_DIR:-literature/md}"    # where .md files are written
+BIB_DIR="${LIT_BIB_DIR:-literature/bib}"   # where .bib sidecars are written
 LOG_DIR="${LIT_LOG_DIR:-literature/logs}"
+MAILTO="${CROSSREF_MAILTO:-}"              # Crossref polite-pool contact
 AUTO_YES=0
-BIB_SYNC=0
+BIB_SYNC=0          # --bib : opt-in sync to the CENTRAL reference library
+ENRICH=1            # local Crossref enrichment + .bib sidecar (on by default)
+ENRICH_ONLY=0
+SEARCH_FALLBACK=0
+REFRESH=0
 
 usage() {
   cat <<'EOF'
-Usage: sync_literature.sh [--src DIR] [--out DIR] [--bib] [--yes]
-  --src DIR   source folder of PDFs      (default: literature/pdf)
-  --out DIR   output folder for .md      (default: literature/md)
-  --bib       also sync each result into the gemini-pdf reference library
-              (requires GEMINI_PDF_REFERENCE_DIR to be set)
-  --yes       actually convert (without it, the script previews and exits)
-Without --yes, the script only lists pending files and exits (no API calls).
+Usage: sync_literature.sh [--src DIR] [--out DIR] [--bib-dir DIR] [--mailto ADDR]
+                          [--no-enrich] [--search-fallback] [--refresh]
+                          [--enrich-only] [--bib] [--yes]
+
+  --src DIR          source folder of PDFs        (default: literature/pdf)
+  --out DIR          output folder for .md        (default: literature/md)
+  --bib-dir DIR      output folder for .bib       (default: literature/bib)
+  --mailto ADDR      contact address for the Crossref polite pool
+  --no-enrich        skip Crossref enrichment and .bib generation
+  --search-fallback  for papers with no DOI, try a Crossref title search
+                     (result is flagged UNVERIFIED — always check it)
+  --refresh          re-query Crossref even for already-enriched files
+  --enrich-only      no conversion; enrich/refresh the existing .md tree only
+  --bib              ALSO sync each result into the central gemini-pdf reference
+                     library (requires GEMINI_PDF_REFERENCE_DIR). Off by default:
+                     that library is shared global state and its bib entries are
+                     never replaced once written.
+  --yes              actually run (without it, the script previews and exits)
+
+Without --yes, the script only lists pending work and exits (no API calls).
 EOF
 }
 
@@ -29,12 +49,70 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --src) SRC_DIR="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
+    --bib-dir) BIB_DIR="$2"; shift 2 ;;
+    --mailto) MAILTO="$2"; shift 2 ;;
+    --no-enrich) ENRICH=0; shift ;;
+    --search-fallback) SEARCH_FALLBACK=1; shift ;;
+    --refresh) REFRESH=1; shift ;;
+    --enrich-only) ENRICH_ONLY=1; shift ;;
     --bib) BIB_SYNC=1; shift ;;
     --yes) AUTO_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ENRICHER="$HERE/enrich_metadata.py"
+PYTHON="$(command -v python3 || command -v python || true)"
+
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/literature_sync.log"
+
+# ---- Shared: build the enricher's argument list ------------------------------
+_enrich_args() {
+  printf '%s\n' --bib-dir "$BIB_DIR" --md-dir "$OUT_DIR"
+  [ -n "$MAILTO" ] && printf '%s\n' --mailto "$MAILTO"
+  [ "$SEARCH_FALLBACK" -eq 1 ] && printf '%s\n' --search-fallback
+  [ "$REFRESH" -eq 1 ] && printf '%s\n' --refresh
+  return 0
+}
+
+_enrich_ready() {
+  [ "$ENRICH" -eq 1 ] || return 1
+  if [ -z "$PYTHON" ]; then
+    echo "WARN: python3 not found — skipping enrichment/.bib" >&2; return 1
+  fi
+  if [ ! -f "$ENRICHER" ]; then
+    echo "WARN: $ENRICHER not found — skipping enrichment/.bib" >&2; return 1
+  fi
+  return 0
+}
+
+# ---- --enrich-only: no conversion, no agy, no gemini-pdf needed --------------
+if [ "$ENRICH_ONLY" -eq 1 ]; then
+  [ -d "$OUT_DIR" ] || { echo "No md dir: $OUT_DIR  (nothing to do)"; exit 0; }
+  _enrich_ready || exit 1
+
+  total=$(find "$OUT_DIR" -type f -name '*.md' | wc -l | tr -d ' ')
+  nobib=0
+  while IFS= read -r -d '' md; do
+    rel="${md#"$OUT_DIR"/}"; bib="$BIB_DIR/${rel%.md}.bib"
+    [ -f "$bib" ] || nobib=$((nobib+1))
+  done < <(find "$OUT_DIR" -type f -name '*.md' -print0)
+
+  echo "Markdown: $OUT_DIR    Bib: $BIB_DIR"
+  echo "MD files: $total    Missing .bib: $nobib"
+  if [ "$AUTO_YES" -ne 1 ]; then
+    echo
+    echo "Preview only. Re-run with --yes to query Crossref and write .bib files."
+    exit 0
+  fi
+  mapfile -t EARGS < <(_enrich_args)
+  echo "[$(date -u +%FT%TZ)] enrich-only over $OUT_DIR" | tee -a "$LOG"
+  "$PYTHON" "$ENRICHER" --batch "${EARGS[@]}" 2>>"$LOG"
+  exit 0
+fi
 
 # ---- Locate the gemini-pdf skill --------------------------------------------
 # Search order:
@@ -69,8 +147,7 @@ if [ ! -d "$SRC_DIR" ]; then
   echo "No source dir: $SRC_DIR  (nothing to do)"
   exit 0
 fi
-mkdir -p "$OUT_DIR" "$LOG_DIR"
-LOG="$LOG_DIR/literature_sync.log"
+mkdir -p "$OUT_DIR"
 
 # ---- Stash converter sidecars out of the md tree ----------------------------
 # gemini-pdf writes <base>.meta.json / <base>.quality.json / <base>.err next to
@@ -94,6 +171,22 @@ _stash_sidecars() {
     fi
   done
   [ "$moved" -eq 1 ] && echo "[$(date -u +%FT%TZ)] stashed sidecars -> $dest/$base.*" >>"$LOG"
+  return 0
+}
+
+# ---- Enrich one converted file (never fatal) --------------------------------
+# Volume / issue / pages are fetched from Crossref via the DOI rather than asked
+# of the LLM: they are often absent from the printed PDF and are the numeric
+# fields most damaged by OCR. A .bib sidecar is written either way; entries not
+# confirmed by Crossref are marked UNVERIFIED in a leading comment.
+_enrich_one() {
+  local md="$1" eargs
+  _enrich_ready || return 0
+  mapfile -t eargs < <(_enrich_args)
+  if ! "$PYTHON" "$ENRICHER" --md "$md" "${eargs[@]}" >>"$LOG" 2>&1; then
+    echo "  WARN: enrichment failed for $md (see $LOG)"
+  fi
+  return 0
 }
 
 # ---- Find PDFs without a matching .md (mirror subfolder structure) ----------
@@ -109,10 +202,11 @@ for pdf in "${PDFS[@]}"; do
 done
 
 N=${#TODO[@]}
-echo "Source: $SRC_DIR    Output: $OUT_DIR"
+echo "Source: $SRC_DIR    Output: $OUT_DIR    Bib: $BIB_DIR"
 echo "PDFs found: ${#PDFS[@]}    Need conversion: $N"
 if [ "$N" -eq 0 ]; then
   echo "Everything already converted."
+  echo "(To backfill .bib for the existing library: --enrich-only --yes)"
   exit 0
 fi
 
@@ -123,6 +217,7 @@ for item in "${TODO[@]}"; do echo "  - ${item%%|*}"; done
 if [ "$AUTO_YES" -ne 1 ]; then
   echo
   echo "Preview only. $N file(s) would be converted sequentially (~1-4 min per chunk each)."
+  [ "$ENRICH" -eq 1 ] && echo "Each result would then be enriched from Crossref and given a .bib in $BIB_DIR."
   echo "Re-run with --yes to convert."
   exit 0
 fi
@@ -136,13 +231,13 @@ for item in "${TODO[@]}"; do
   if [ "$BIB_SYNC" -eq 1 ]; then
     key="$(basename "${md%.md}")"
     if bash "$CONVERT" "$pdf" "$md" --bib-key "$key" >>"$LOG" 2>&1; then
-      ok=$((ok+1)); _stash_sidecars "$md"
+      ok=$((ok+1)); _stash_sidecars "$md"; _enrich_one "$md"
     else
       fail=$((fail+1)); echo "  FAILED (see $LOG)"
     fi
   else
     if bash "$CONVERT" "$pdf" "$md" >>"$LOG" 2>&1; then
-      ok=$((ok+1)); _stash_sidecars "$md"
+      ok=$((ok+1)); _stash_sidecars "$md"; _enrich_one "$md"
     else
       fail=$((fail+1)); echo "  FAILED (see $LOG)"
     fi
