@@ -23,6 +23,12 @@ Design notes
   re-runs skip already-enriched files unless `--refresh` is passed.
 * Network failure is non-fatal: the `.md` is left untouched and the exit code
   stays 0 so a Crossref outage never fails a conversion run.
+* BibTeX keys are *sanitized* file names, not raw ones: spaces, commas and dots
+  are illegal or fatal in a key (`@article{Senhu, Yi and Yang 2023 PRPR,` breaks
+  the parser at the comma). The link back to the source file is preserved in the
+  `file` field instead, which keeps the key -> source mapping that
+  `citation-check` relies on. Non-ASCII letters are kept by default (valid in
+  biber / upBibTeX); `--ascii-keys` forces a legacy-bibtex-safe key.
 
 Usage
 -----
@@ -39,6 +45,7 @@ Exit codes: 0 = done (including "skipped" and "network unavailable"),
 import argparse
 import datetime as _dt
 import difflib
+import hashlib
 import html
 import json
 import os
@@ -50,7 +57,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 CROSSREF_API = "https://api.crossref.org/works"
 DEFAULT_TIMEOUT = 20
@@ -303,7 +310,7 @@ def normalize_item(item):
 
     page = item.get("page")
     if page:
-        meta["pages"] = re.sub(r"\s*[-\u2013\u2014]+\s*", "--", str(page).strip())
+        meta["pages"] = re.sub(r"\s*[-–—]+\s*", "--", str(page).strip())
 
     if item.get("DOI"):
         meta["doi"] = item["DOI"]
@@ -339,7 +346,92 @@ def bib_escape(value):
     return value.strip()
 
 
+def bib_escape_path(value):
+    """Escape a file path for the non-standard `file` field.
+
+    Tools such as JabRef and Zotero read this field literally, so LaTeX-escaping
+    `_` or `&` would corrupt the path. Only the characters that would break
+    brace matching are removed; backslashes become forward slashes so a path
+    written on Windows still resolves.
+    """
+    return (str(value).replace("\\", "/")
+            .replace("{", "").replace("}", "").strip())
+
+
 PARTICLES = ["van der", "van den", "van", "de la", "della", "de", "di", "del", "el", "ter"]
+
+
+# --- BibTeX keys -----------------------------------------------------------
+# A key may not contain whitespace, a comma, or braces. A comma is fatal: it
+# terminates the key and the rest of the entry becomes a parse error. Real
+# library filenames routinely contain all three ("Senhu, Yi and Yang 2023
+# PRPR.pdf"), so the key is derived from the filename rather than copied.
+
+KEY_BAD = re.compile(r"[^\w:\-]", re.UNICODE)     # \w keeps letters (any script) + digits + _
+KEY_HAS_LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
+BIB_KEY_IN_FILE = re.compile(r"^@\w+\s*\{\s*([^,\s]+)\s*,", re.MULTILINE)
+
+
+def sanitize_key(name, ascii_only=False):
+    """File name -> a BibTeX-legal citation key.
+
+    Default keeps non-ASCII letters, which biber and upBibTeX accept and which
+    keeps Japanese sources citable as themselves. `ascii_only` drops them for
+    legacy bibtex and falls back to a hashed key when nothing citable is left.
+    """
+    original = name
+    lossy = False
+    if ascii_only:
+        name = unicodedata.normalize("NFKD", name)
+        stripped = name.encode("ascii", "ignore").decode("ascii")
+        lossy = KEY_HAS_LETTER.search(name) and stripped != name
+        name = stripped
+    key = KEY_BAD.sub("-", name)
+    key = re.sub(r"-{2,}", "-", key).strip("-_")
+    if not KEY_HAS_LETTER.search(key):
+        digest = hashlib.sha1(original.encode("utf-8")).hexdigest()[:4]
+        key = re.sub(r"-{2,}", "-", f"ref-{key}-{digest}").strip("-")
+    elif lossy:
+        # Letters were dropped, so the remainder is not reliably distinctive
+        # ("北 荻野 辻村 DP" -> "DP"). A digest of the original name keeps the key
+        # unique and stable across runs rather than order-dependent.
+        key += "-" + hashlib.sha1(original.encode("utf-8")).hexdigest()[:4]
+    return key or "ref-unknown"
+
+
+def collect_existing_keys(bib_dir, exclude=None):
+    """Every key already present in the .bib tree, minus the file we're rewriting.
+
+    Excluding our own target keeps re-runs idempotent: a paper does not acquire
+    a `-2` suffix just because its previous entry is still on disk.
+    """
+    keys = set()
+    if not bib_dir or not os.path.isdir(bib_dir):
+        return keys
+    exclude = os.path.abspath(exclude) if exclude else None
+    for root, _dirs, names in os.walk(bib_dir):
+        for n in names:
+            if not n.endswith(".bib"):
+                continue
+            path = os.path.join(root, n)
+            if exclude and os.path.abspath(path) == exclude:
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    keys.update(BIB_KEY_IN_FILE.findall(fh.read()))
+            except OSError:
+                continue
+    return keys
+
+
+def unique_key(base, taken):
+    """Disambiguate against keys already in use, so a concatenated .bib is valid."""
+    if base not in taken:
+        return base
+    i = 2
+    while f"{base}-{i}" in taken:
+        i += 1
+    return f"{base}-{i}"
 
 
 def format_author(name):
@@ -375,8 +467,12 @@ def entry_type(meta):
     journal = (meta.get("journal") or "").lower()
     if not journal:
         return "misc"
-    if any(k in journal for k in ("conference", "proceedings", "neurips",
-                                  "icml", "iclr", "aaai", "aistats")):
+    # "Proceedings" alone is not a conference signal — "Proceedings of the
+    # National Academy of Sciences" is a journal. Require an explicit conference
+    # word or a known conference name.
+    if "conference" in journal or any(
+            k in journal for k in ("neurips", "icml", "iclr", "aaai", "aistats",
+                                   "conf. proc", "conference proceedings")):
         return "inproceedings"
     if any(k in journal for k in ("arxiv", "nber", "working paper", "ssrn",
                                   "discussion paper", "mimeo")):
@@ -384,7 +480,7 @@ def entry_type(meta):
     return "article"
 
 
-def build_bib(key, meta, provenance):
+def build_bib(key, meta, provenance, file_name=None):
     etype = entry_type(meta)
     fields = []
 
@@ -421,7 +517,9 @@ def build_bib(key, meta, provenance):
     if meta.get("doi"):
         fields.append(("doi", bib_escape(meta["doi"])))
 
-    fields.append(("file", f"{bib_escape(key)}.pdf"))
+    # The key is sanitized, so `file` is what still ties the entry to the source
+    # PDF on disk (relative to the pdf/ root, mirroring the md/ tree).
+    fields.append(("file", bib_escape_path(file_name or f"{key}.pdf")))
 
     body = ",\n".join(f"  {name} = {{{value}}}" for name, value in fields)
     header = (f"% {provenance}\n"
@@ -445,25 +543,53 @@ def write_text(path, text):
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def enrich_one(md_path, args):
-    """Returns one of: 'enriched', 'unverified', 'skipped', 'offline', 'nofm'."""
-    key = os.path.basename(md_path)[:-3] if md_path.endswith(".md") else os.path.basename(md_path)
+def relative_name(md_path, args):
+    """Path of this paper relative to the md tree, without the .md extension."""
+    rel = os.path.basename(md_path)
+    if args.md_dir and os.path.isdir(args.md_dir):
+        candidate = os.path.relpath(os.path.abspath(md_path),
+                                    os.path.abspath(args.md_dir))
+        if not candidate.startswith(os.pardir):
+            rel = candidate
+    return rel[:-3] if rel.endswith(".md") else rel
+
+
+def enrich_one(md_path, args, taken=None):
+    """Returns 'enriched' | 'unverified' | 'rebuilt' | 'skipped' | 'offline' | 'nofm'."""
+    rel = relative_name(md_path, args)
+    bib_target = bib_path_for(md_path, args) if args.bib_dir else None
+    if taken is None:
+        taken = collect_existing_keys(args.bib_dir, exclude=bib_target)
+    key = unique_key(sanitize_key(os.path.basename(rel), args.ascii_keys), taken)
+    taken.add(key)
+    source_pdf = rel + ".pdf"
     meta, block, start, end, lines = read_front_matter(md_path)
 
     if meta is None:
         log(args, f"  no front matter: {md_path}")
-        if args.bib_dir:
-            path = bib_path_for(md_path, args)
-            if not os.path.exists(path) or args.refresh:
-                write_text(path, build_bib(key, {"title": key},
-                                           "source: filename only \u2014 UNVERIFIED"))
+        if bib_target:
+            if not os.path.exists(bib_target) or args.refresh:
+                write_text(bib_target,
+                           build_bib(key, {"title": os.path.basename(rel)},
+                                     "source: filename only — UNVERIFIED",
+                                     source_pdf))
         return "nofm"
 
+    merged = {k: v for k, v in meta.items() if not k.startswith("_")}
+    if "authors" in merged:
+        merged["authors"] = split_authors(merged["authors"])
+
     marker = meta.get("crossref", "")
-    if marker and not args.refresh:
-        if DATE_RE.match(marker) or not args.search_fallback:
-            log(args, f"  skip (already processed: {marker}): {key}")
-            return "skipped"
+    if marker and not args.refresh and (DATE_RE.match(marker) or not args.search_fallback):
+        # Already queried. Don't re-query — but a missing .bib still has to be
+        # rebuilt, so deleting literature/bib/ and re-running restores it.
+        if bib_target and not os.path.exists(bib_target):
+            write_text(bib_target, build_bib(
+                key, merged, f"source: front matter (crossref: {marker})", source_pdf))
+            log(args, f"  bib rebuilt -> {bib_target}  (key: {key})")
+            return "rebuilt"
+        log(args, f"  skip (already processed: {marker}): {key}")
+        return "skipped"
 
     doi = clean_doi(meta.get("doi", ""))
     item, score, provenance = None, 0.0, ""
@@ -474,7 +600,7 @@ def enrich_one(md_path, args):
             if not network_ok(args):
                 log(args, f"  Crossref unreachable, left untouched: {key}")
                 return "offline"
-            provenance = f"source: front matter \u2014 DOI {doi} not found in Crossref, UNVERIFIED"
+            provenance = f"source: front matter — DOI {doi} not found in Crossref, UNVERIFIED"
         else:
             provenance = f"source: Crossref ({doi})"
     elif args.search_fallback:
@@ -483,16 +609,12 @@ def enrich_one(md_path, args):
                                       args.mailto, args.timeout, args.threshold)
         if item is not None:
             provenance = (f"source: Crossref title search "
-                          f"(similarity {score:.2f}) \u2014 VERIFY BEFORE CITING")
+                          f"(similarity {score:.2f}) — VERIFY BEFORE CITING")
         else:
-            provenance = (f"source: front matter \u2014 no DOI, no confident Crossref "
+            provenance = (f"source: front matter — no DOI, no confident Crossref "
                           f"match (best {score:.2f}), UNVERIFIED")
     else:
-        provenance = "source: front matter \u2014 no DOI, UNVERIFIED"
-
-    merged = {k: v for k, v in meta.items() if not k.startswith("_")}
-    if "authors" in merged:
-        merged["authors"] = split_authors(merged["authors"])
+        provenance = "source: front matter — no DOI, UNVERIFIED"
 
     status = "unverified"
     updates = {}
@@ -521,11 +643,10 @@ def enrich_one(md_path, args):
         if new_block != block:
             write_front_matter(md_path, lines, start, end, new_block)
 
-    if args.bib_dir:
-        path = bib_path_for(md_path, args)
-        if not os.path.exists(path) or args.refresh or item is not None:
-            write_text(path, build_bib(key, merged, provenance))
-            log(args, f"  bib -> {path}")
+    if bib_target:
+        if not os.path.exists(bib_target) or args.refresh or item is not None:
+            write_text(bib_target, build_bib(key, merged, provenance, source_pdf))
+            log(args, f"  bib -> {bib_target}  (key: {key})")
 
     return status
 
@@ -537,15 +658,7 @@ def network_ok(args):
 
 def bib_path_for(md_path, args):
     """Mirror the md tree's subfolder structure under --bib-dir."""
-    rel = os.path.basename(md_path)
-    if args.md_dir and os.path.isdir(args.md_dir):
-        candidate = os.path.relpath(os.path.abspath(md_path),
-                                    os.path.abspath(args.md_dir))
-        if not candidate.startswith(os.pardir):   # md_path really is under md_dir
-            rel = candidate
-    if rel.endswith(".md"):
-        rel = rel[:-3]
-    return os.path.join(args.bib_dir, rel + ".bib")
+    return os.path.join(args.bib_dir, relative_name(md_path, args) + ".bib")
 
 
 def log(args, msg):
@@ -574,6 +687,9 @@ def main():
                    help="title-similarity cutoff for --search-fallback (default 0.90)")
     p.add_argument("--search-fallback", action="store_true",
                    help="when no DOI is present, try a title search (flagged for review)")
+    p.add_argument("--ascii-keys", action="store_true",
+                   help="force ASCII-only BibTeX keys for legacy bibtex "
+                        "(default keeps non-ASCII letters, valid in biber/upBibTeX)")
     p.add_argument("--refresh", action="store_true",
                    help="re-query even if the file carries a crossref: marker")
     p.add_argument("--no-md-update", action="store_true",
@@ -600,8 +716,14 @@ def main():
                     targets.append(os.path.join(root, n))
 
     tally = {}
+    # One shared registry so keys stay unique across the whole library, which
+    # matters as soon as the .bib files are concatenated for a LaTeX build.
+    taken = collect_existing_keys(args.bib_dir) if args.batch else None
+    if taken is not None:
+        taken -= {sanitize_key(os.path.basename(relative_name(t, args)),
+                               args.ascii_keys) for t in targets}
     for i, path in enumerate(targets):
-        status = enrich_one(path, args)
+        status = enrich_one(path, args, taken)
         tally[status] = tally.get(status, 0) + 1
         if args.batch and i < len(targets) - 1:
             time.sleep(0.2)          # be polite to Crossref
