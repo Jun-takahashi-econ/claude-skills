@@ -104,12 +104,37 @@ The `.bib` entry is written either way. Its first line records provenance:
 
 Entry type follows the Crossref work type (`journal-article` → `@article`, `report` →
 `@techreport`, `proceedings-article` → `@inproceedings`, …), falling back to venue-name
-heuristics when Crossref has nothing. The BibTeX key is the **file name**, matching
-`file = {KEY.pdf}` and the key→source mapping `citation-check` relies on. Keep filenames in
-a citable form (`andrews-1999-ecma.pdf`), not `2401.12345v2.pdf`.
+heuristics when Crossref has nothing.
+
+## Citation keys
+
+The key is a **sanitized** file name, not a raw one. A BibTeX key may not contain
+whitespace or a comma, and a comma is fatal — it terminates the key and the rest of the
+entry becomes a parse error. Real library filenames routinely contain both:
+
+| file | key |
+|---|---|
+| `Senhu, Yi and Yang 2023 PRPR.pdf` | `Senhu-Yi-and-Yang-2023-PRPR` |
+| `Aassve et al.  2024 PNAS.pdf` | `Aassve-et-al-2024-PNAS` |
+| `日銀 2018.pdf` | `日銀-2018` (`--ascii-keys`: `ref-2018-a8db`) |
+
+Non-ASCII letters are kept by default, which biber and upBibTeX accept and which keeps
+Japanese sources citable as themselves. Pass `--ascii-keys` for legacy `bibtex`, which
+drops them and appends a short digest of the original name so the key stays unique and
+stable across runs.
+
+The link back to the source is preserved in the `file` field, which carries the real
+filename and its subfolder (`file = {conjoint/Bansak et al. 2019.pdf}`) — that is the
+key→source mapping `citation-check` relies on. Keys are also deduplicated against the rest
+of `literature/bib/`, so concatenating the whole tree into one `.bib` never produces a
+duplicate-key error.
 
 **Failure is non-fatal.** If Crossref is unreachable, the `.md` is left untouched, no
 marker is written, and the run exits 0 — the paper is simply retried next time.
+
+**A missing `.bib` is always rebuilt.** The `crossref:` marker suppresses the network
+query, not the file: delete `literature/bib/` and re-run, and every entry comes back from
+the front matter without a single API call.
 
 ## Local `.bib` vs. the central reference library
 
@@ -147,6 +172,7 @@ has neither problem: delete it and re-run.
 | `--yes` | (off) | Actually run; without it the script previews and exits |
 | `--no-enrich` | (off) | Skip Crossref lookup and `.bib` generation |
 | `--search-fallback` | (off) | For papers with no DOI, try a Crossref title search |
+| `--ascii-keys` | (off) | Force ASCII-only citation keys (legacy `bibtex`) |
 | `--refresh` | (off) | Re-query Crossref for already-enriched files |
 | `--enrich-only` | (off) | No conversion; enrich/backfill the existing `.md` tree |
 | `--bib` | (off) | Also sync into the central library (needs `GEMINI_PDF_REFERENCE_DIR`) |
