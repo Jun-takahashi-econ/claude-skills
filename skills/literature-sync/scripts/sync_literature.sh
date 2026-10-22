@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # literature-sync: convert every PDF in the source dir that lacks a matching
-# Markdown file, delegating conversion to the gemini-pdf skill (agy / Antigravity),
-# then enrich the result's front matter from Crossref and write a local .bib.
+# Markdown file, delegating conversion to the gemini-pdf skill's pipeline, then
+# enrich the result's front matter from Crossref and write a local .bib.
+#
+# Engine (--engine / LIT_ENGINE):
+#   claude (default) — gemini-pdf's pipeline runs unchanged, but its `agy` calls
+#                      are routed to headless Claude Code (`claude -p`) through
+#                      scripts/claude-engine/agy. Model: LIT_CLAUDE_MODEL (sonnet).
+#   gemini           — the original Antigravity CLI (agy) path.
 #
 # Idempotent: existing .md files are skipped. Raw PDFs are never modified or deleted.
-# Sequential by design (agy hangs in parallel). Prints a count-only summary.
+# Sequential by design (agy hangs in parallel; Claude shares one usage limit).
+# Prints a count-only summary.
 set -euo pipefail
 
 # ---- Config (override via env or flags) -------------------------------------
@@ -19,12 +26,13 @@ ENRICH=1            # local Crossref enrichment + .bib sidecar (on by default)
 ENRICH_ONLY=0
 SEARCH_FALLBACK=0
 REFRESH=0
+ENGINE="${LIT_ENGINE:-claude}"             # claude | gemini
 
 usage() {
   cat <<'EOF'
 Usage: sync_literature.sh [--src DIR] [--out DIR] [--bib-dir DIR] [--mailto ADDR]
                           [--no-enrich] [--search-fallback] [--refresh]
-                          [--enrich-only] [--bib] [--yes]
+                          [--enrich-only] [--bib] [--engine claude|gemini] [--yes]
 
   --src DIR          source folder of PDFs        (default: literature/pdf)
   --out DIR          output folder for .md        (default: literature/md)
@@ -39,6 +47,10 @@ Usage: sync_literature.sh [--src DIR] [--out DIR] [--bib-dir DIR] [--mailto ADDR
                      library (requires GEMINI_PDF_REFERENCE_DIR). Off by default:
                      that library is shared global state and its bib entries are
                      never replaced once written.
+  --engine NAME      conversion engine: claude (default) or gemini.
+                     claude routes gemini-pdf's model calls to `claude -p`
+                     (model: LIT_CLAUDE_MODEL, default sonnet; effort:
+                     LIT_CLAUDE_EFFORT, default low). gemini uses agy.
   --yes              actually run (without it, the script previews and exits)
 
 Without --yes, the script only lists pending work and exits (no API calls).
@@ -56,11 +68,17 @@ while [ $# -gt 0 ]; do
     --refresh) REFRESH=1; shift ;;
     --enrich-only) ENRICH_ONLY=1; shift ;;
     --bib) BIB_SYNC=1; shift ;;
+    --engine) ENGINE="$2"; shift 2 ;;
     --yes) AUTO_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+case "$ENGINE" in
+  claude|gemini) ;;
+  *) echo "unknown engine: $ENGINE (use claude or gemini)" >&2; exit 2 ;;
+esac
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENRICHER="$HERE/enrich_metadata.py"
@@ -142,6 +160,35 @@ fi
 CONVERT="$GEMINI_PDF/scripts/pdf_to_markdown.sh"
 [ -f "$CONVERT" ] || { echo "ERROR: converter not found at $CONVERT" >&2; exit 1; }
 
+# ---- Engine setup -----------------------------------------------------------
+# The claude engine puts an `agy` shim first on PATH (for the converter only),
+# so the upstream pipeline is reused unmodified. GEMINI_PDF_MODEL is set to the
+# Claude model so the converter's own log names the model actually used.
+LIMIT_FLAG=""
+if [ "$ENGINE" = "claude" ]; then
+  SHIM_DIR="$HERE/claude-engine"
+  [ -x "$SHIM_DIR/agy" ] || chmod +x "$SHIM_DIR/agy" 2>/dev/null || true
+  [ -f "$SHIM_DIR/agy" ] || { echo "ERROR: claude shim missing at $SHIM_DIR/agy" >&2; exit 1; }
+  if [ "$AUTO_YES" -eq 1 ] && ! command -v claude >/dev/null 2>&1; then
+    echo "ERROR: --engine claude needs the Claude Code CLI ('claude') on PATH." >&2
+    echo "       Use --engine gemini to convert with agy instead." >&2
+    exit 1
+  fi
+  CLAUDE_MODEL="${LIT_CLAUDE_MODEL:-sonnet}"
+  LIMIT_FLAG="$(mktemp "${TMPDIR:-/tmp}/lit-claude-limit.XXXXXX")"
+  rm -f "$LIMIT_FLAG"
+  trap 'rm -f "$LIMIT_FLAG"' EXIT
+  ENGINE_DESC="claude ($CLAUDE_MODEL, effort ${LIT_CLAUDE_EFFORT-low})"
+  _convert() {
+    PATH="$SHIM_DIR:$PATH" GEMINI_PDF_MODEL="$CLAUDE_MODEL" \
+      LIT_CLAUDE_MODEL="$CLAUDE_MODEL" LIT_CLAUDE_LIMIT_FLAG="$LIMIT_FLAG" \
+      bash "$CONVERT" "$@"
+  }
+else
+  ENGINE_DESC="gemini (agy, ${GEMINI_PDF_MODEL:-gemini-pdf default model})"
+  _convert() { bash "$CONVERT" "$@"; }
+fi
+
 # ---- Guards -----------------------------------------------------------------
 if [ ! -d "$SRC_DIR" ]; then
   echo "No source dir: $SRC_DIR  (nothing to do)"
@@ -203,6 +250,7 @@ done
 
 N=${#TODO[@]}
 echo "Source: $SRC_DIR    Output: $OUT_DIR    Bib: $BIB_DIR"
+echo "Engine: $ENGINE_DESC"
 echo "PDFs found: ${#PDFS[@]}    Need conversion: $N"
 if [ "$N" -eq 0 ]; then
   echo "Everything already converted."
@@ -216,33 +264,44 @@ for item in "${TODO[@]}"; do echo "  - ${item%%|*}"; done
 # ---- Preview unless --yes (no conversion, no API calls without --yes) --------
 if [ "$AUTO_YES" -ne 1 ]; then
   echo
-  echo "Preview only. $N file(s) would be converted sequentially (~1-4 min per chunk each)."
+  echo "Preview only. $N file(s) would be converted sequentially with $ENGINE_DESC (~1-4 min per chunk each)."
   [ "$ENRICH" -eq 1 ] && echo "Each result would then be enriched from Crossref and given a .bib in $BIB_DIR."
   echo "Re-run with --yes to convert."
   exit 0
 fi
 
 # ---- Convert ----------------------------------------------------------------
-ok=0; fail=0
+# A partial .md written while the usage limit hit would be mistaken for a
+# finished conversion on the next run (existing .md files are skipped), so it
+# is moved aside to logs/ and the PDF stays pending.
+_quarantine_partial() {
+  local md="$1" dest="$LOG_DIR/partial"
+  [ -f "$md" ] || return 0
+  mkdir -p "$dest"
+  mv -f "$md" "$dest/$(basename "$md")"
+  echo "[$(date -u +%FT%TZ)] usage limit: partial output moved to $dest/" >>"$LOG"
+}
+
+ok=0; fail=0; stopped=0
 for item in "${TODO[@]}"; do
   pdf="${item%%|*}"; md="${item##*|}"
   mkdir -p "$(dirname "$md")"
-  echo "[$(date -u +%FT%TZ)] convert: $pdf -> $md" | tee -a "$LOG"
-  if [ "$BIB_SYNC" -eq 1 ]; then
-    key="$(basename "${md%.md}")"
-    if bash "$CONVERT" "$pdf" "$md" --bib-key "$key" >>"$LOG" 2>&1; then
-      ok=$((ok+1)); _stash_sidecars "$md"; _enrich_one "$md"
-    else
-      fail=$((fail+1)); echo "  FAILED (see $LOG)"
-    fi
+  echo "[$(date -u +%FT%TZ)] convert [$ENGINE]: $pdf -> $md" | tee -a "$LOG"
+  extra=()
+  [ "$BIB_SYNC" -eq 1 ] && extra=(--bib-key "$(basename "${md%.md}")")
+  if _convert "$pdf" "$md" ${extra[@]+"${extra[@]}"} >>"$LOG" 2>&1; then rc=0; else rc=1; fi
+  if [ -n "$LIMIT_FLAG" ] && [ -f "$LIMIT_FLAG" ]; then
+    _stash_sidecars "$md"; _quarantine_partial "$md"
+    stopped=$(( N - ok - fail ))
+    echo "  STOPPED: Claude usage limit reached. $stopped file(s) left pending; re-run after the limit resets." | tee -a "$LOG"
+    break
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ok=$((ok+1)); _stash_sidecars "$md"; _enrich_one "$md"
   else
-    if bash "$CONVERT" "$pdf" "$md" >>"$LOG" 2>&1; then
-      ok=$((ok+1)); _stash_sidecars "$md"; _enrich_one "$md"
-    else
-      fail=$((fail+1)); echo "  FAILED (see $LOG)"
-    fi
+    fail=$((fail+1)); echo "  FAILED (see $LOG)"
   fi
 done
 
-echo "Done. converted=$ok  failed=$fail  log=$LOG"
-[ "$fail" -eq 0 ]
+echo "Done. converted=$ok  failed=$fail  pending=$stopped  log=$LOG"
+[ "$fail" -eq 0 ] && [ "$stopped" -eq 0 ]

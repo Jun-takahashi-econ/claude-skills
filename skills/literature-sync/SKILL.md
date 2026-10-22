@@ -1,15 +1,15 @@
 ---
 name: literature-sync
-description: Convert new paper PDFs in a literature folder to Markdown, enrich each paper's metadata from Crossref (volume, issue, pages, publisher), and write a local BibTeX sidecar — so the reference library stays current for citation checks and hallucination defense. Reconcile is idempotent — only PDFs without a matching .md are converted (existing .md files are skipped); raw PDFs are never modified. Delegates the actual conversion to the gemini-pdf skill (Antigravity CLI / agy vision pathway). Triggers include "sync the literature folder", "convert new literature PDFs", "I dropped a paper in literature", "update the reference library", "generate bibtex for my papers", "backfill the .bib files", and "PDF to markdown for my citations".
+description: Convert new paper PDFs in a literature folder to Markdown, enrich each paper's metadata from Crossref (volume, issue, pages, publisher), and write a local BibTeX sidecar — so the reference library stays current for citation checks and hallucination defense. Reconcile is idempotent — only PDFs without a matching .md are converted (existing .md files are skipped); raw PDFs are never modified. Reuses the gemini-pdf skill's conversion pipeline, with the model calls sent to Claude Sonnet via headless Claude Code by default (--engine gemini restores the Antigravity CLI / agy path). Triggers include "sync the literature folder", "convert new literature PDFs", "I dropped a paper in literature", "update the reference library", "generate bibtex for my papers", "backfill the .bib files", and "PDF to markdown for my citations".
 ---
 
 # literature-sync
 
 Keep `literature/md/` and `literature/bib/` in sync with `literature/pdf/`. Drop a paper
 PDF into the source folder; this skill finds every PDF that has no matching Markdown yet,
-converts it one at a time using the `gemini-pdf` skill, then completes its bibliographic
-metadata from Crossref and writes a `.bib` sidecar. It is a thin orchestrator — it does
-**not** reimplement conversion.
+converts it one at a time using the `gemini-pdf` skill's pipeline, then completes its
+bibliographic metadata from Crossref and writes a `.bib` sidecar. It is a thin orchestrator —
+it does **not** reimplement conversion.
 
 ## When to use
 
@@ -20,14 +20,48 @@ metadata from Crossref and writes a `.bib` sidecar. It is a thin orchestrator �
 
 ## Prerequisite
 
-The **`gemini-pdf`** skill must be installed (from Kasahara's `claude-code-skills`), and
-`agy` (Antigravity CLI) must be signed in. This skill locates `gemini-pdf` automatically at
-`$CLAUDE_PLUGIN_ROOT/skills/gemini-pdf` or `~/.claude/skills/gemini-pdf`.
+The **`gemini-pdf`** skill must be installed (from Kasahara's `claude-code-skills`). This
+skill locates it automatically at `$CLAUDE_PLUGIN_ROOT/skills/gemini-pdf` or
+`~/.claude/skills/gemini-pdf`. Then, depending on the engine:
+
+- **`--engine claude` (default):** the Claude Code CLI (`claude`) signed in. `agy` is not needed.
+- **`--engine gemini`:** `agy` (Antigravity CLI) signed in.
 
 Enrichment needs `python3` (stdlib only — no pip install) and outbound access to
 `api.crossref.org`. Both are optional: without them, conversion still works and the
 enrichment step is skipped with a warning. `--enrich-only` does **not** need `gemini-pdf`
 or `agy` at all.
+
+## Conversion engines
+
+| | `claude` (default) | `gemini` |
+|---|---|---|
+| Model | `LIT_CLAUDE_MODEL` (default `sonnet`) | `GEMINI_PDF_MODEL` (gemini-pdf default) |
+| Billing | Claude subscription usage | Google AI plan / Antigravity quota |
+| Documents sent to | Anthropic | Google |
+
+The `claude` engine does not fork `gemini-pdf`. `scripts/claude-engine/agy` is a small shim
+that accepts the converter's `agy -p` calls and runs
+`claude -p … --model sonnet --tools Read --permission-mode dontAsk` in the chunk's isolated
+folder. Chunking (≤10 pages), sentinel validation, retries, bisection, quality gates,
+sanitizing and the Mathpix fallback are the upstream pipeline, unchanged. The shim is put on
+`PATH` only for the converter process, so a real `agy` elsewhere is untouched.
+
+To keep usage down, each call:
+
+- uses **Sonnet** and `--effort low` (`LIT_CLAUDE_EFFORT`; set it empty for the CLI
+  default) — transcription needs little reasoning;
+- runs in `--safe-mode` (no CLAUDE.md, skills, plugins, hooks or MCP servers), so the
+  global instructions are not re-sent with every chunk;
+- is allowed only the `Read` tool, and is not saved as a resumable session.
+
+Optional flags are feature-detected from `claude --help`, so older CLI versions fall back to
+`--strict-mcp-config` / `--disable-slash-commands`.
+
+**Usage limit.** If Claude reports a usage or rate limit, the batch **stops**: further
+calls in that run fail immediately without contacting Claude, the partial `.md` (if any) is
+moved to `literature/logs/partial/` so the PDF stays pending, and the summary reports
+`pending=N`. Re-run after the limit resets.
 
 ## Quick usage
 
@@ -45,6 +79,9 @@ bash "$LIT/scripts/sync_literature.sh"
 # Convert + enrich + write .bib (sequential; ~1-4 min per chunk). --yes is required.
 bash "$LIT/scripts/sync_literature.sh" --yes
 
+# Use Gemini via agy instead of Claude
+bash "$LIT/scripts/sync_literature.sh" --engine gemini --yes
+
 # Backfill .bib for a library that is already converted
 bash "$LIT/scripts/sync_literature.sh" --enrich-only --yes
 
@@ -61,7 +98,7 @@ bash "$LIT/scripts/sync_literature.sh" --enrich-only --search-fallback --yes
 ```
 find literature/pdf/ -iname '*.pdf'
   for each PDF whose literature/md/<same-name>.md is MISSING:
-      gemini-pdf/scripts/pdf_to_markdown.sh  <pdf>  <md>
+      gemini-pdf/scripts/pdf_to_markdown.sh  <pdf>  <md>   # model calls: claude -p (or agy)
       stash gemini-pdf's .meta.json / .quality.json / .err into literature/logs/sidecars/
       enrich_metadata.py --md <md>            # Crossref lookup by DOI
           -> completes the front matter (volume, number, pages, publisher, ...)
@@ -71,8 +108,8 @@ log every action to literature/logs/literature_sync.log
 print a COUNT-ONLY summary (converted / skipped / failed)
 ```
 
-- **Sequential by design.** `agy` hangs when run in parallel, so conversions run one at a
-  time. Dropping 20 PDFs is fine; they process in series (~1-4 min per chunk each).
+- **Sequential by design.** `agy` hangs when run in parallel, and with Claude every call
+  draws on one usage limit, so conversions run one at a time. Dropping 20 PDFs is fine; they process in series (~1-4 min per chunk each).
 - **Preview by default.** Without `--yes` the script only lists pending files and exits —
   no conversion, no API calls. Pass `--yes` to actually run.
 - **Idempotent.** Re-running only picks up genuinely new/missing files. Enrichment records
@@ -169,6 +206,9 @@ has neither problem: delete it and re-run.
 | `--out` / `LIT_OUT_DIR` | `literature/md` | Where `.md` files are written |
 | `--bib-dir` / `LIT_BIB_DIR` | `literature/bib` | Where `.bib` sidecars are written |
 | `--mailto` / `CROSSREF_MAILTO` | (unset) | Contact address for the Crossref polite pool |
+| `--engine` / `LIT_ENGINE` | `claude` | Conversion engine: `claude` or `gemini` |
+| `LIT_CLAUDE_MODEL` | `sonnet` | Claude model for the `claude` engine |
+| `LIT_CLAUDE_EFFORT` | `low` | Effort for the `claude` engine (empty = CLI default) |
 | `--yes` | (off) | Actually run; without it the script previews and exits |
 | `--no-enrich` | (off) | Skip Crossref lookup and `.bib` generation |
 | `--search-fallback` | (off) | For papers with no DOI, try a Crossref title search |
@@ -184,8 +224,8 @@ has neither problem: delete it and re-run.
 - No destructive shell ops. No `rm -rf`.
 - Claude does **not** read PDF/MD bodies into context — only counts, logs, and (at most) the
   10-line YAML frontmatter of a converted file.
-- Conversion sends documents to Google via `agy`. Do not place confidential or embargoed
-  PDFs here. Never commit API keys.
+- Conversion sends documents to Anthropic (`claude` engine) or Google (`gemini` engine).
+  Do not place confidential or embargoed PDFs here. Never commit API keys.
 - Crossref queries send only the DOI (or, with `--search-fallback`, the title and first two
   author names) — never the document.
 - Figures in converted markdown are caption-only placeholders; verify any figure-based claim

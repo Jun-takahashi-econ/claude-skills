@@ -9,13 +9,13 @@ central set of skills instead of copying them into each repository.
 > [`hkasahar/claude-code-skills`](https://github.com/hkasahar/claude-code-skills) and are
 > used from my fork (kept current with *Sync fork*). **This** repository holds *my own*
 > skills only, to avoid duplicate maintenance. `literature-sync` depends on `gemini-pdf`
-> being installed.
+> being installed (its pipeline is reused; the model calls go to Claude by default).
 
 ## Skills
 
 | Skill | What it does |
 |---|---|
-| **`literature-sync`** | Convert new paper PDFs in `literature/pdf/` to Markdown in `literature/md/`, delegating to `gemini-pdf` (agy). Idempotent reconcile; on demand, at session start, or via an optional watcher. |
+| **`literature-sync`** | Convert new paper PDFs in `literature/pdf/` to Markdown in `literature/md/`, reusing the `gemini-pdf` pipeline with Claude Sonnet (default) or Gemini via agy. Idempotent reconcile; on demand, at session start, or via an optional watcher. |
 | **`citation-check`** | Verify every citation in a draft against original source text in the reference library — never model memory. SUPPORTED / MISCHARACTERIZED / MISSING SOURCE. |
 | **`conjoint-amce`** | AMCEs + marginal means from long-format conjoint data, respondent-clustered SEs, tidy tables + forest plot, reconcile vs. existing results. |
 | **`conjoint-diagnostics`** | Pass/fail gates before trusting AMCEs: balance, placebo, profile order, carryover, SE ratio, comprehension robustness. |
@@ -51,10 +51,12 @@ LIT="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/skills/literature-sync}"
 LIT="${LIT:-$HOME/.claude/skills/literature-sync}"
 
 bash "$LIT/scripts/sync_literature.sh"        # preview: list PDFs needing conversion
-bash "$LIT/scripts/sync_literature.sh" --yes  # convert them (sequential)
+bash "$LIT/scripts/sync_literature.sh" --yes  # convert them (sequential, Claude Sonnet)
+bash "$LIT/scripts/sync_literature.sh" --yes --engine gemini   # old path via agy
 ```
 
-Prerequisite: the `gemini-pdf` skill installed and `agy` (Antigravity CLI) signed in.
+Prerequisite: the `gemini-pdf` skill installed, plus the signed-in `claude` CLI (default
+engine) or `agy` (Antigravity CLI, `--engine gemini`).
 Details: [skills/literature-sync/SKILL.md](skills/literature-sync/SKILL.md).
 
 ## Python dependencies (conjoint skills)
@@ -65,8 +67,8 @@ pip install pandas numpy statsmodels scipy matplotlib pyreadstat
 
 ## Security
 
-- Skills run shell commands; some send documents to external services (Google via `agy`,
-  OpenAI via `codex`). **Do not send confidential or embargoed material. Never commit API
+- Skills run shell commands; some send documents to external services (Anthropic via
+  `claude -p`, Google via `agy`, OpenAI via `codex`). **Do not send confidential or embargoed material. Never commit API
   keys** — `refine` reads `OPENAI_API_KEY` from the environment only.
 - `literature/pdf/` (raw sources) is read-only to these skills.
 - Review scripts before running — they are short and readable.
