@@ -43,7 +43,7 @@ or `agy` at all.
 The `claude` engine does not fork `gemini-pdf`. `scripts/claude-engine/agy` is a small shim
 that accepts the converter's `agy -p` calls and runs
 `claude -p … --model sonnet --tools Read --permission-mode dontAsk` in the chunk's isolated
-folder. Chunking (≤10 pages), sentinel validation, retries, bisection, quality gates,
+folder. Chunking, sentinel validation, retries, bisection, quality gates,
 sanitizing and the Mathpix fallback are the upstream pipeline, unchanged. The shim is put on
 `PATH` only for the converter process, so a real `agy` elsewhere is untouched.
 
@@ -55,8 +55,19 @@ To keep usage down, each call:
   global instructions are not re-sent with every chunk;
 - is allowed only the `Read` tool, and is not saved as a resumable session.
 
+**Chunk size.** The `claude` engine sends **3 pages per call** (`LIT_CLAUDE_PAGES_PER_CHUNK`;
+an explicit `GEMINI_PDF_PAGES_PER_CHUNK` wins). On gemini-pdf's 10-page default Claude cuts
+long transcriptions short (sentinel missing / output-to-source ratio below floor), and on a
+30-page paper the retries and bisections exhaust the attempt budget before the later pages
+are reached. Smaller chunks finish in one call each, so they also use *fewer* calls in total.
+
 Optional flags are feature-detected from `claude --help`, so older CLI versions fall back to
 `--strict-mcp-config` / `--disable-slash-commands`.
+
+**Incomplete output.** gemini-pdf exits successfully even when some chunks failed (it keeps
+its best attempt with `<!-- CHUNK N FAILED -->` placeholders). literature-sync treats any
+such file as a failure: it is moved to `literature/logs/partial/`, no `.bib` is written,
+and the PDF stays pending for the next run — otherwise the next sync would skip it for good.
 
 **Usage limit.** If Claude reports a usage or rate limit, the batch **stops**: further
 calls in that run fail immediately without contacting Claude, the partial `.md` (if any) is
@@ -209,6 +220,7 @@ has neither problem: delete it and re-run.
 | `--engine` / `LIT_ENGINE` | `claude` | Conversion engine: `claude` or `gemini` |
 | `LIT_CLAUDE_MODEL` | `sonnet` | Claude model for the `claude` engine |
 | `LIT_CLAUDE_EFFORT` | `low` | Effort for the `claude` engine (empty = CLI default) |
+| `LIT_CLAUDE_PAGES_PER_CHUNK` | `3` | Pages per Claude call (`GEMINI_PDF_PAGES_PER_CHUNK` overrides) |
 | `--yes` | (off) | Actually run; without it the script previews and exits |
 | `--no-enrich` | (off) | Skip Crossref lookup and `.bib` generation |
 | `--search-fallback` | (off) | For papers with no DOI, try a Crossref title search |
