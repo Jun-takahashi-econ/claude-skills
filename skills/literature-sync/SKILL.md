@@ -56,10 +56,22 @@ To keep usage down, each call:
 - is allowed only the `Read` tool, and is not saved as a resumable session.
 
 **Chunk size.** The `claude` engine sends **3 pages per call** (`LIT_CLAUDE_PAGES_PER_CHUNK`;
-an explicit `GEMINI_PDF_PAGES_PER_CHUNK` wins). On gemini-pdf's 10-page default Claude cuts
-long transcriptions short (sentinel missing / output-to-source ratio below floor), and on a
-30-page paper the retries and bisections exhaust the attempt budget before the later pages
-are reached. Smaller chunks finish in one call each, so they also use *fewer* calls in total.
+an explicit `GEMINI_PDF_PAGES_PER_CHUNK` wins).
+
+**Read without `pages`.** The shim's system prompt tells Claude to read each chunk PDF whole,
+never with Read's `pages` parameter. On Windows, Read with `pages` falsely reports an
+unencrypted PDF as "password-protected"; Claude then returns a one-line apology instead of a
+transcription, so every multi-page chunk fails gemini-pdf's sentinel / output-to-source ratio
+check within seconds while single-page chunks pass, and the bisections exhaust the attempt
+budget before the later pages are reached. (0.3.1 misattributed this to Claude cutting long
+transcriptions short.)
+
+**Known gemini-pdf false results (either engine).** (1) Figure-only pages, such as 3-D surface
+plots, can fail the ratio check even when transcribed correctly: the source size comes from
+`pdftotext -layout`, which pads axis labels with whitespace (a 2.0 KB page measures 6.3 KB).
+Convert such pages singly and splice them over the `CHUNK N FAILED` placeholders. (2) A chunk
+can pass every check and still silently drop a whole page. Before trusting a file, check
+coverage page by page against `pdftotext`.
 
 Optional flags are feature-detected from `claude --help`, so older CLI versions fall back to
 `--strict-mcp-config` / `--disable-slash-commands`.

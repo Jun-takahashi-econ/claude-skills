@@ -13,7 +13,7 @@
       "source": "./",
       "strict": false,
       "description": "Convert new paper PDFs in a literature folder to Markdown (Claude Sonnet by default, Gemini via agy optional), enrich metadata from Crossref (volume, issue, pages), and write local BibTeX sidecars with sanitized citation keys. Idempotent reconcile: PDFs without a matching .md are converted; existing .md files are skipped; raw PDFs are never modified.",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "license": "MIT",
       "homepage": "https://github.com/Jun-takahashi-econ/claude-skills",
       "keywords": ["claude-code", "literature", "pdf", "markdown", "bibtex", "crossref", "gemini-pdf", "reference-library", "claude"],
