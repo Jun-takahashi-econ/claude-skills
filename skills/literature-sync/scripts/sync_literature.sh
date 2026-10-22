@@ -175,12 +175,18 @@ if [ "$ENGINE" = "claude" ]; then
     exit 1
   fi
   CLAUDE_MODEL="${LIT_CLAUDE_MODEL:-sonnet}"
+  # Claude truncates long transcriptions (sentinel missing / output-to-source
+  # ratio below floor) on gemini-pdf's 10-page chunks; 3-page chunks complete
+  # reliably and leave the retry budget (2 x chunks + 6) for real failures.
+  # An explicit GEMINI_PDF_PAGES_PER_CHUNK still wins.
+  CLAUDE_PAGES="${GEMINI_PDF_PAGES_PER_CHUNK:-${LIT_CLAUDE_PAGES_PER_CHUNK:-3}}"
   LIMIT_FLAG="$(mktemp "${TMPDIR:-/tmp}/lit-claude-limit.XXXXXX")"
   rm -f "$LIMIT_FLAG"
   trap 'rm -f "$LIMIT_FLAG"' EXIT
-  ENGINE_DESC="claude ($CLAUDE_MODEL, effort ${LIT_CLAUDE_EFFORT-low})"
+  ENGINE_DESC="claude ($CLAUDE_MODEL, effort ${LIT_CLAUDE_EFFORT-low}, $CLAUDE_PAGES pages/chunk)"
   _convert() {
     PATH="$SHIM_DIR:$PATH" GEMINI_PDF_MODEL="$CLAUDE_MODEL" \
+      GEMINI_PDF_PAGES_PER_CHUNK="$CLAUDE_PAGES" \
       LIT_CLAUDE_MODEL="$CLAUDE_MODEL" LIT_CLAUDE_LIMIT_FLAG="$LIMIT_FLAG" \
       bash "$CONVERT" "$@"
   }
@@ -271,15 +277,22 @@ if [ "$AUTO_YES" -ne 1 ]; then
 fi
 
 # ---- Convert ----------------------------------------------------------------
+# A converted .md that still contains a failed-chunk placeholder is missing
+# pages. gemini-pdf exits 0 in that case (it keeps its best attempt), but if
+# the file stayed in the md tree the next sync would skip the PDF for good.
+_is_incomplete() { [ -f "$1" ] && grep -q '<!-- CHUNK [0-9]* FAILED' "$1"; }
+
 # A partial .md written while the usage limit hit would be mistaken for a
 # finished conversion on the next run (existing .md files are skipped), so it
 # is moved aside to logs/ and the PDF stays pending.
 _quarantine_partial() {
-  local md="$1" dest="$LOG_DIR/partial"
+  local md="$1" why="${2:-usage limit}" rel dest
   [ -f "$md" ] || return 0
+  rel="${md#"$OUT_DIR"/}"
+  dest="$LOG_DIR/partial/$(dirname "$rel")"
   mkdir -p "$dest"
   mv -f "$md" "$dest/$(basename "$md")"
-  echo "[$(date -u +%FT%TZ)] usage limit: partial output moved to $dest/" >>"$LOG"
+  echo "[$(date -u +%FT%TZ)] $why: partial output moved to $dest/" >>"$LOG"
 }
 
 ok=0; fail=0; stopped=0
@@ -296,7 +309,12 @@ for item in "${TODO[@]}"; do
     echo "  STOPPED: Claude usage limit reached. $stopped file(s) left pending; re-run after the limit resets." | tee -a "$LOG"
     break
   fi
-  if [ "$rc" -eq 0 ]; then
+  if [ "$rc" -eq 0 ] && _is_incomplete "$md"; then
+    n_failed=$(grep -c '<!-- CHUNK [0-9]* FAILED' "$md" || true)
+    _stash_sidecars "$md"; _quarantine_partial "$md" "incomplete ($n_failed failed chunk(s))"
+    fail=$((fail+1))
+    echo "  INCOMPLETE: $n_failed chunk(s) failed; partial .md moved to $LOG_DIR/partial/ and the PDF stays pending (see $LOG)"
+  elif [ "$rc" -eq 0 ]; then
     ok=$((ok+1)); _stash_sidecars "$md"; _enrich_one "$md"
   else
     fail=$((fail+1)); echo "  FAILED (see $LOG)"
