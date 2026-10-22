@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# agy -> claude shim for literature-sync's Claude engine.
+#
+# gemini-pdf's pdf_to_markdown.sh drives Antigravity CLI as
+#   agy [--model M] [--add-dir DIR] [--print-timeout Ns] -p PROMPT   (cwd = DIR)
+# and probes `agy --help` for "--model". When sync_literature.sh runs with
+# --engine claude it puts THIS directory first on PATH, so every call is
+# translated into a headless Claude Code call instead:
+#   claude -p PROMPT --model <claude model> --add-dir DIR  (Read tool only)
+# Chunking, sentinel validation, retries, bisection, quality gates, sanitizing
+# and the Mathpix fallback all stay in the unmodified upstream script.
+#
+# Model: the --model value is used only if it is not a Gemini name; otherwise
+# LIT_CLAUDE_MODEL (default: sonnet). Effort: LIT_CLAUDE_EFFORT (default: low;
+# set it empty to use the CLI default). Transcription needs little reasoning, so
+# low effort keeps subscription usage down.
+#
+# Usage-limit handling: if Claude reports a usage/rate limit, the shim exits
+# non-zero and touches $LIT_CLAUDE_LIMIT_FLAG so the batch can stop instead of
+# burning retries on every remaining chunk.
+set -uo pipefail
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  echo "agy (literature-sync Claude shim) — options: --model <name> --add-dir <dir> --print-timeout <s> -p <prompt>"
+  exit 0
+fi
+
+model="" prompt="" have_prompt=0
+add_dirs=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) model="${2:-}"; shift 2 ;;
+    --add-dir) add_dirs+=("${2:-}"); shift 2 ;;
+    --print-timeout) shift 2 ;;               # gemini-pdf's own watchdog bounds the call
+    -p|--print) prompt="${2:-}"; have_prompt=1; shift 2 ;;
+    *) shift ;;                                # ignore other agy-only flags
+  esac
+done
+
+if [ "$have_prompt" -ne 1 ]; then
+  echo "claude shim: only 'agy -p PROMPT' is supported" >&2
+  exit 2
+fi
+
+# Once a usage limit has been hit in this batch, fail fast: the converter's
+# retries and bisections would otherwise call Claude again for every chunk.
+if [ -n "${LIT_CLAUDE_LIMIT_FLAG:-}" ] && [ -f "$LIT_CLAUDE_LIMIT_FLAG" ]; then
+  echo "claude shim: usage limit already reached in this batch; skipping call" >&2
+  exit 75
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "claude shim: Claude Code CLI ('claude') not found on PATH" >&2
+  exit 127
+fi
+
+case "$model" in
+  ""|*[Gg]emini*|*[Ff]lash*) model="${LIT_CLAUDE_MODEL:-sonnet}" ;;
+esac
+effort="${LIT_CLAUDE_EFFORT-low}"
+
+# Feature-detect optional flags so older Claude Code versions still work.
+help="$(env -u CLAUDECODE claude --help 2>/dev/null || true)"
+has() { printf '%s' "$help" | grep -q -- "$1"; }
+
+args=(-p "$prompt" --model "$model" --output-format text --allowedTools Read)
+has '--tools <'               && args+=(--tools Read)
+has 'dontAsk'                 && args+=(--permission-mode dontAsk)
+# Skip CLAUDE.md, skills, plugins, hooks and MCP servers: they add tokens to
+# every chunk and nothing in them is needed for transcription.
+if has '--safe-mode'; then
+  args+=(--safe-mode)
+else
+  has '--strict-mcp-config'      && args+=(--strict-mcp-config)
+  has '--disable-slash-commands' && args+=(--disable-slash-commands)
+fi
+has '--no-session-persistence' && args+=(--no-session-persistence)
+if [ -n "$effort" ] && has '--effort'; then args+=(--effort "$effort"); fi
+has '--append-system-prompt' && args+=(--append-system-prompt \
+  "You are a document transcription engine. Use only the Read tool, only on the PDF named in the request. Your final message must be the requested Markdown and nothing else: no preamble, no commentary, no code fence around the whole output.")
+for d in ${add_dirs[@]+"${add_dirs[@]}"}; do args+=(--add-dir "$d"); done
+
+out="$(mktemp "${TMPDIR:-/tmp}/lit-claude-out.XXXXXX")"
+trap 'rm -f "$out"' EXIT
+
+# CLAUDECODE is unset so a sync launched from inside a Claude Code session is
+# not refused as a nested session. stdin passes through (text/hybrid pipelines).
+env -u CLAUDECODE claude "${args[@]}" > "$out"
+rc=$?
+
+# A usage-limit notice is short and contains no transcription.
+size=$(wc -c < "$out" | tr -d ' ')
+if [ "$size" -lt 2000 ] && grep -qiE 'usage limit|limit reached|rate.?limit|out of (extra )?usage|credit balance' "$out"; then
+  cat "$out" >&2
+  [ -n "${LIT_CLAUDE_LIMIT_FLAG:-}" ] && : > "$LIT_CLAUDE_LIMIT_FLAG"
+  exit 75
+fi
+
+cat "$out"
+exit "$rc"
