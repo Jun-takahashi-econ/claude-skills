@@ -154,6 +154,13 @@ So `enrich_metadata.py` takes the DOI from the front matter, queries Crossref, a
 the same time. Crossref wins on conflict and every overwritten value is logged, so the diff
 stays auditable. The paper body is never touched — only the front matter block.
 
+Values are written as valid YAML: a value that would break a plain scalar is double-quoted,
+for example a title containing `: ` such as `"Notes for a New Guide to Keynes (I): Wages, …"`.
+Unquoted, such a title fails to parse ("Nested mappings are not allowed in compact
+mappings"), and Markdown viewers then show no metadata. Files that earlier versions wrote
+unquoted are re-quoted on the next run, including files already processed. The file's own
+line endings (LF or CRLF) are kept.
+
 The `.bib` entry is written either way. Its first line records provenance:
 
 ```
