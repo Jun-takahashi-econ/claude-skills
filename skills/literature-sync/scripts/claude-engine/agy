@@ -76,8 +76,11 @@ else
 fi
 has '--no-session-persistence' && args+=(--no-session-persistence)
 if [ -n "$effort" ] && has '--effort'; then args+=(--effort "$effort"); fi
+# Read must be called without 'pages': on Windows, Read with 'pages' falsely reports an
+# unencrypted PDF as password-protected, so the model gives up and every multi-page chunk
+# fails the sentinel/ratio check. The chunk PDF already holds only the requested pages.
 has '--append-system-prompt' && args+=(--append-system-prompt \
-  "You are a document transcription engine. Use only the Read tool, only on the PDF named in the request. Your final message must be the requested Markdown and nothing else: no preamble, no commentary, no code fence around the whole output.")
+  "You are a document transcription engine. Use only the Read tool, only on the PDF named in the request, and call it WITHOUT the 'pages' parameter: read the whole file at once (it already contains exactly the requested page range). Your final message must be the requested Markdown and nothing else: no preamble, no commentary, no code fence around the whole output.")
 for d in ${add_dirs[@]+"${add_dirs[@]}"}; do args+=(--add-dir "$d"); done
 
 out="$(mktemp "${TMPDIR:-/tmp}/lit-claude-out.XXXXXX")"

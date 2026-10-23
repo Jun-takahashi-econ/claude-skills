@@ -130,10 +130,35 @@ def read_front_matter(md_path):
         if not m:
             continue
         key = m.group(1).lower()
-        value = m.group(2).strip().strip('"').strip("'")
+        value = fm_unquote(m.group(2).strip())
         if value:
             meta[key] = value
     return meta, lines[i + 1:end], i, end, lines
+
+
+# A plain YAML scalar is unsafe when it contains ": " or " #", ends with ":",
+# starts with an indicator character, or has edge whitespace. A title such as
+# "Notes for a New Guide to Keynes (I): Wages, ..." left unquoted fails to parse
+# ("Nested mappings are not allowed in compact mappings"), and Markdown viewers
+# then show no metadata at all.
+_FM_UNSAFE = re.compile(r""":\s|\s#|:$|^[-?:,\[\]{}#&*!|>'"%@`]|^\s|\s$""")
+
+
+def fm_quote(value):
+    """Render a front matter value as a YAML scalar, double-quoted when needed."""
+    value = str(value)
+    if not _FM_UNSAFE.search(value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def fm_unquote(raw):
+    """Inverse of fm_quote; also reads single-quoted and legacy plain values."""
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        return re.sub(r"\\(.)", r"\1", raw[1:-1])
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1].replace("''", "'")
+    return raw
 
 
 def split_authors(value):
@@ -144,9 +169,10 @@ def split_authors(value):
 def render_front_matter(block_lines, updates):
     """Merge `updates` into an existing front matter block.
 
-    Existing managed keys are updated in place (order preserved); unmanaged
-    lines are kept verbatim; new managed keys are appended in MANAGED_KEYS
-    order after the last recognised line.
+    Existing managed keys are updated in place (order preserved) and quoted
+    when their value needs it, which also repairs blocks that older versions
+    wrote unquoted; unmanaged lines are kept verbatim; new managed keys are
+    appended in MANAGED_KEYS order after the last recognised line.
     """
     out = []
     seen = set()
@@ -157,21 +183,26 @@ def render_front_matter(block_lines, updates):
             continue
         key = m.group(1).lower()
         if key in updates:
-            out.append(f"{key}: {updates[key]}")
+            out.append(f"{key}: {fm_quote(updates[key])}")
             seen.add(key)
+        elif key in MANAGED_KEYS and m.group(2).strip():
+            out.append(f"{key}: {fm_quote(fm_unquote(m.group(2).strip()))}")
         else:
             out.append(line)
     for key in MANAGED_KEYS:
         if key in updates and key not in seen:
-            out.append(f"{key}: {updates[key]}")
+            out.append(f"{key}: {fm_quote(updates[key])}")
     return out
 
 
 def write_front_matter(md_path, lines, start, end, new_block):
     new_lines = lines[:start + 1] + new_block + lines[end:]
+    # Keep the file's own line endings; text mode would turn LF into CRLF on Windows.
+    with open(md_path, "rb") as fh:
+        eol = "\r\n" if b"\r\n" in fh.read(4096) else "\n"
     tmp = md_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(new_lines) + "\n")
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(eol.join(new_lines) + eol)
     os.replace(tmp, md_path)
 
 
@@ -581,6 +612,12 @@ def enrich_one(md_path, args, taken=None):
 
     marker = meta.get("crossref", "")
     if marker and not args.refresh and (DATE_RE.match(marker) or not args.search_fallback):
+        # Already queried, but still repair quoting that older versions wrote.
+        if not args.no_md_update:
+            fixed = render_front_matter(block, {})
+            if fixed != block:
+                write_front_matter(md_path, lines, start, end, fixed)
+                log(args, f"  front matter re-quoted: {key}")
         # Already queried. Don't re-query — but a missing .bib still has to be
         # rebuilt, so deleting literature/bib/ and re-running restores it.
         if bib_target and not os.path.exists(bib_target):
